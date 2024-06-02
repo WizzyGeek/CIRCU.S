@@ -3,6 +3,9 @@ from __future__ import annotations
 from enum import Enum, IntEnum, StrEnum
 import typing as t
 
+from textwrap import indent
+
+
 class Operator(StrEnum):
     AND  = "&"
     OR   = "|"
@@ -12,16 +15,32 @@ class Operator(StrEnum):
     # NAND = "~&"
     # NOR  = "~|"
 
-op_precedence = {
-    "&": 50,
-    "|": 50,
-    "^": 50,
-    "=": 10
-}
+    @property
+    def precedence(self):
+        return op_precedence[self]
+
+    def can_stack(self, stack: list[WorkingOp]):
+        return (not stack) or (stack[-1] == "(") or (stack[-1].precedence < self.precedence)
+
 
 class UnraryOperator(StrEnum):
     NOT = "!"
 
+    @property
+    def precedence(self):
+        return 100
+
+    def can_stack(self, stack: list[WorkingOp]):
+        return True
+
+WorkingOp = Operator | UnraryOperator | t.Literal["("]
+
+op_precedence = {
+    Operator.AND: 50,
+    Operator.OR: 50,
+    Operator.XOR: 50,
+    Operator.ASSIGN: 10
+}
 
 AND_LUT = [
     [0, 0, 0],
@@ -45,14 +64,23 @@ XOR_LUT = [
     [2, 2, 2]
 ]
 
-class Operand:
+class Lvalue:
+    pass
+
+class Rvalue:
+    pass
+
+class Operand(Lvalue, Rvalue):
     __slots__ = ("index")
     index: int
 
     def __init__(self, index: int):
         self.index = index
 
-class BitOperand:
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(index={self.index})"
+
+class BitOperand(Lvalue, Rvalue):
     __slots__ = ("index", "bidx")
     index: int
     bidx: int
@@ -61,19 +89,56 @@ class BitOperand:
         self.index = index
         self.bidx  = bidx
 
-class Expression:
-    le: Expression | Operand | BitOperand | UnraryOp
-    re: Expression | Operand | BitOperand | UnraryOp
+    def __repr__(self) -> str:
+        i = indent(f'\nindex={self.index},\nbidx={self.bidx}', "    ")
+        return f"{self.__class__.__name__}({i}\n)"
+
+class Expression(Rvalue):
+    le: Node
+    re: Node
     op: Operator
 
     __slots__ = ("le", "re", "op")
 
-class UnraryOp:
-    operand: Expression | Operand | BitOperand | UnraryOp
-    op: Operator
+    def __init__(self, re: Node, le: Node, op: Operator) -> None:
+        if op == Operator.ASSIGN and not isinstance(le, Lvalue):
+            raise ValueError("Cannot assign to a non lvalue")
+        self.le = le
+        self.re = re
+        self.op = op
+
+    def __repr__(self) -> str:
+        i = indent(f'\nop={self.op!r},\nle={self.le},\nre={self.re}', "    ")
+        return f"{self.__class__.__name__}({i}\n)"
+
+class UnraryOp(Rvalue, Lvalue):
+    operand: Node
+    op: UnraryOperator
 
     __slots__ = ("operand", "op")
 
+    def __init__(self, operand: Node, op: UnraryOperator) -> None:
+        self.operand = operand
+        self.op = op
+
+    def __repr__(self) -> str:
+        i = indent(f'\nop={self.op},\noperand={self.operand}', "    ")
+        return f"{self.__class__.__name__}({i}\n)"
+
+
+class Constant(Rvalue):
+    value: int
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: int):
+        self.value = value
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(value={self.value})"
+
+
+Node = Expression | Operand | BitOperand | UnraryOp | Constant
 
 class TokenType(Enum):
     NEWLINE = 0
@@ -119,6 +184,10 @@ single_char_lut = {
     "=": TokenType.ASSIGN,
 }
 
+op_token_precedence = {
+    single_char_lut[c]: prec for c, prec in op_precedence.items()
+}
+
 kw_lut = {
     "persistent": TokenType.PERS,
     "vector": TokenType.VEC,
@@ -160,7 +229,7 @@ class Tokeniser:
                 return Token(single_char_lut[buf], buf)
 
             c += 1
-            while c < sl and not (s[c].isspace() or s[c] == "[" or s[c] == "]"):
+            while c < sl and not (s[c].isspace() or s[c] in single_char_lut):
                 buf += s[c]
                 c += 1
             c -= 1
@@ -208,6 +277,10 @@ class Variable:
             raise ValueError(f"Out of bounds index {bidx} for vector at index {self.index}")
         return BitOperand(self.index, bidx)
 
+    def __repr__(self) -> str:
+        i = indent(f'\nvector={self.vector},\nindex={self.index},\ntype={self.type!r}', "    ")
+        return f"{self.__class__.__name__}({i}\n)"
+
 # class Circuit:
 
 variable_type_lut = {
@@ -219,28 +292,96 @@ variable_type_lut = {
 
 class Parser:
     variables: dict[str, Variable]
-    body: list[Expression]
+    vlist: list[Variable]
+    body: list[Node]
+    _curr_idx: int
 
     def __init__(self) -> None:
-        self.variables = {}
-        self.vlist = []
+        self.variables: dict[str, Variable] = {}
+        self.vlist: list[Variable] = []
         self.body = []
         self._curr_idx = 0
 
+    def __repr__(self) -> str:
+        i = indent(f'\nvariables={self.variables},\nbody={self.body}', "    ")
+        return f"{self.__class__.__name__}({i}\n)"
+
     # shunt yard algorithm
     def parse(self, tok: Tokeniser) -> None:
-        comb = []
-        aux = []
+        comb: list[Node] = []
+        aux: list[WorkingOp] = []
         while tok.open:
             t = tok.next_token()
             if t.type in variable_type_lut:
                 tok.undo(t)
                 self.parse_decl(tok)
-                continue
+                comb.append(self.vlist[-1].make_operand())
+            elif t.type == TokenType.IDENT:
+                t2 = tok.next_token()
+                if t2.type == TokenType.LRECT:
+                    try:
+                        t2 = tok.next_token()
+                        assert t2.type == TokenType.NUM
+                        bidx = int(t2.value)
+                        assert tok.next_token().type == TokenType.RRECT
+                    except AssertionError as err:
+                        raise ValueError("Invalid indexing syntax") from err
+                    if not self.variables[t.value].vector:
+                        raise ValueError("Cannot index non vector operand")
+                    comb.append(self.variables[t.value].make_bit_operand(bidx))
+                else: tok.undo(t2)
 
-            if t.type == TokenType.IDENT:
-                comb.append(self.variables[t.value].make_operand())
-            ...
+                try:
+                    comb.append(self.variables[t.value].make_operand())
+                except KeyError as err:
+                    raise ValueError(f"Identifier {t.value!r} not declared before use") from err
+            elif t.type in op_token_precedence:
+                op = Operator(t.value)
+                while not op.can_stack(aux):
+                    w = aux.pop()
+                    if isinstance(w, Operator):
+                        comb.append(Expression(comb.pop(), comb.pop(), w))
+                    elif isinstance(w, UnraryOperator):
+                        comb.append(UnraryOp(comb.pop(), w))
+                    else:
+                        raise RuntimeError # Unreachable
+                aux.append(op)
+            elif t.type == TokenType.LPARA:
+                aux.append("(")
+            elif t.type == TokenType.RPARA:
+                while aux and ((wop := aux.pop()) != "("):
+                    try:
+                        if isinstance(wop, Operator):
+                            comb.append(Expression(comb.pop(), comb.pop(), wop))
+                        elif isinstance(wop, UnraryOperator):
+                            comb.append(UnraryOp(comb.pop(), wop))
+                    except IndexError:
+                        raise ValueError("Invalid expression")
+            elif t.type == TokenType.NUM:
+                comb.append(Constant(int(t.value)))
+            elif t.type == TokenType.NEWLINE or t.type == TokenType.EOF:
+                while aux:
+                    # print(aux, comb)
+                    wop = aux.pop()
+                    try:
+                        if isinstance(wop, Operator):
+                            comb.append(Expression(comb.pop(), comb.pop(), wop))
+                        elif isinstance(wop, UnraryOperator):
+                            comb.append(UnraryOp(comb.pop(), wop))
+                        else: raise ValueError("Expression terminated with unbalanced parantheses")
+                    except IndexError:
+                        raise ValueError("Invalid Expression")
+                if len(comb) > 1:
+                    print(comb)
+                    raise ValueError("Invalid Expression, irreducible.")
+                # Could have assign inside! this should not be optimised here
+                # if isinstance(comb[0], Expression) and comb[0].op == Operator.ASSIGN:
+                if comb:
+                    self.body.append(comb[0])
+                    comb.clear()
+            else:
+                print("Unexpected token", t, t.type, t.value)
+
 
     def parse_decl(self, tok: Tokeniser) -> None:
         t = tok.next_token()
@@ -286,11 +427,25 @@ class Parser:
         self.vlist.append(k)
         self._curr_idx += 1
 
-# t = Tokeniser("""output vector a[3];""")
-# p = Parser()
 
-# p.parse_decl(t)
-# print(p.variables)
-# while t.open:
-#     tok = t.next_token()
-#     print(tok.type, repr(tok.value))
+if __name__ == "__main__":
+    t = Tokeniser(
+        """
+        persistent k;
+        output q;
+        input t;
+        input p;
+        k = p | (t ^ k);
+        q = k;
+        """
+    )
+    p = Parser()
+
+    # p.parse_decl(t)
+    # print(p.variables)
+    # while t.open:
+    #     tok = t.next_token()
+    #     print(tok.type, repr(tok.value))
+    p.parse(t)
+    from pprint import pprint
+    pprint(p)
