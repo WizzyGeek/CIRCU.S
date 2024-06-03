@@ -346,6 +346,8 @@ class Parser:
                     else:
                         raise RuntimeError # Unreachable
                 aux.append(op)
+            elif t.type == TokenType.NOT:
+                aux.append(UnraryOperator.NOT)
             elif t.type == TokenType.LPARA:
                 aux.append("(")
             elif t.type == TokenType.RPARA:
@@ -435,7 +437,7 @@ if __name__ == "__main__":
         output q;
         input t;
         input p;
-        k = p | (t ^ k);
+        k = p | !(t ^ k);
         q = k;
         """
     )
