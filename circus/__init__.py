@@ -111,7 +111,7 @@ class Expression(Rvalue):
         i = indent(f'\nop={self.op!r},\nle={self.le},\nre={self.re}', "    ")
         return f"{self.__class__.__name__}({i}\n)"
 
-class UnraryOp(Rvalue, Lvalue):
+class UnraryOp(Rvalue):
     operand: Node
     op: UnraryOperator
 
